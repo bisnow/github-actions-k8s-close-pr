@@ -17,8 +17,7 @@ inputs:
     default: 'bisnow'
   namespace:
     description: 'Kubernetes namespace where PR stack is deployed'
-    required: false
-    default: 'biscred-pr-stacks'
+    required: true
   cloudformation-stack-prefix:
     description: 'CloudFormation stack name prefix (e.g., "leads-pr" will match "leads-pr123")'
     required: true
