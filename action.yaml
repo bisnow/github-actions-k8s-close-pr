@@ -11,6 +11,10 @@ inputs:
   service-name:
     description: 'Service name (used for CloudFormation verification)'
     required: true
+  aws-account:
+    description: 'AWS account name for role assumption'
+    required: false
+    default: 'bisnow'
   namespace:
     description: 'Kubernetes namespace where PR stack is deployed'
     required: false
@@ -35,6 +39,11 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Assume AWS Role
+      uses: bisnow/github-actions-assume-role-for-environment@main
+      with:
+        aws-account: ${{ inputs.aws-account }}
+
     - name: Configure kubectl
       shell: bash
       run: |
@@ -143,3 +152,14 @@ runs:
       run: |
         echo "status=success" >> $GITHUB_OUTPUT
         echo "✅ PR #${{ inputs.pr-number }} cleanup completed successfully"
+
+    - name: Summary
+      shell: bash
+      run: |
+        echo "## 🧹 PR Environment Cleaned Up" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Service:** \`${{ inputs.service-name }}\` (\`${{ inputs.app-name }}\`)" >> $GITHUB_STEP_SUMMARY
+        echo "**PR #${{ inputs.pr-number }}** resources have been deleted:" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Helm release: \`pr-${{ inputs.pr-number }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ CloudFormation stack: \`${{ inputs.cloudformation-stack-prefix }}${{ inputs.pr-number }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ All Kubernetes resources removed" >> $GITHUB_STEP_SUMMARY
