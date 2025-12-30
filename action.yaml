@@ -1,0 +1,145 @@
+name: 'Cleanup PR Stack'
+description: 'Safely cleanup Kubernetes PR stack resources, and CloudFormation stack'
+
+inputs:
+  pr-number:
+    description: 'Pull request number'
+    required: true
+  app-name:
+    description: 'Application name (used for resource queries to prevent namespace collisions)'
+    required: true
+  service-name:
+    description: 'Service name (used for CloudFormation verification)'
+    required: true
+  namespace:
+    description: 'Kubernetes namespace where PR stack is deployed'
+    required: false
+    default: 'biscred-pr-stacks'
+  cloudformation-stack-prefix:
+    description: 'CloudFormation stack name prefix (e.g., "leads-pr" will match "leads-pr123")'
+    required: true
+  aws-region:
+    description: 'AWS region for CloudFormation operations'
+    required: false
+    default: 'us-east-1'
+  eks-cluster-name:
+    description: 'EKS cluster name for kubectl configuration'
+    required: false
+    default: 'bisnow-non-prod-eks'
+
+outputs:
+  cleanup-status:
+    description: 'Status of cleanup operation'
+    value: ${{ steps.final-status.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Configure kubectl
+      shell: bash
+      run: |
+        aws eks update-kubeconfig --region ${{ inputs.aws-region }} --name ${{ inputs.eks-cluster-name }}
+
+    - name: Delete PR Stack Helm Release
+      shell: bash
+      run: |
+        echo "Deleting Helm release for PR #${{ inputs.pr-number }}..."
+        helm delete pr-${{ inputs.pr-number }} \
+          --namespace ${{ inputs.namespace }} \
+          --no-hooks || echo "Release may not exist or already deleted"
+
+    - name: Verify Kubernetes Resources Cleaned Up
+      shell: bash
+      run: |
+        echo "Verifying all Kubernetes resources are deleted..."
+        PODS=$(kubectl get pod -n ${{ inputs.namespace }} \
+          -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} \
+          --no-headers 2>/dev/null | wc -l)
+
+        if [ "$PODS" -eq 0 ]; then
+          echo "✅ All pods deleted successfully"
+        else
+          echo "⚠️  Warning: $PODS pod(s) still exist"
+          kubectl get pod -n ${{ inputs.namespace }} \
+            -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }}
+        fi
+
+    - name: Verify CloudFormation Stack Before Deletion
+      id: verify-stack
+      shell: bash
+      run: |
+        STACK_NAME="${{ inputs.cloudformation-stack-prefix }}${{ inputs.pr-number }}"
+        echo "Verifying CloudFormation stack: $STACK_NAME"
+
+        # Check if stack exists
+        if ! aws cloudformation describe-stacks \
+          --stack-name "$STACK_NAME" \
+          --region ${{ inputs.aws-region }} &>/dev/null; then
+          echo "Stack does not exist, nothing to delete"
+          echo "stack-exists=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Verify stack name matches PR pattern (prefix + digits)
+        if [[ ! "$STACK_NAME" =~ ^${{ inputs.cloudformation-stack-prefix }}[0-9]+$ ]]; then
+          echo "ERROR: Stack name doesn't match expected PR pattern: $STACK_NAME"
+          echo "ERROR: Expected pattern: ${{ inputs.cloudformation-stack-prefix }}[0-9]+"
+          exit 1
+        fi
+
+        # Verify stack parameters match expected values
+        ENV_NAME=$(aws cloudformation describe-stacks \
+          --stack-name "$STACK_NAME" \
+          --region ${{ inputs.aws-region }} \
+          --query 'Stacks[0].Parameters[?ParameterKey==`EnvName`].ParameterValue' \
+          --output text)
+
+        SERVICE_NAME=$(aws cloudformation describe-stacks \
+          --stack-name "$STACK_NAME" \
+          --region ${{ inputs.aws-region }} \
+          --query 'Stacks[0].Parameters[?ParameterKey==`ServiceName`].ParameterValue' \
+          --output text)
+
+        EXPECTED_ENV="pr-${{ inputs.pr-number }}"
+        EXPECTED_SERVICE="${{ inputs.service-name }}"
+
+        if [ "$ENV_NAME" != "$EXPECTED_ENV" ]; then
+          echo "ERROR: Stack EnvName ($ENV_NAME) doesn't match expected ($EXPECTED_ENV)"
+          exit 1
+        fi
+
+        if [ "$SERVICE_NAME" != "$EXPECTED_SERVICE" ]; then
+          echo "ERROR: Stack ServiceName ($SERVICE_NAME) doesn't match expected ($EXPECTED_SERVICE)"
+          exit 1
+        fi
+
+        echo "✅ Stack verified - safe to delete"
+        echo "  - Stack Name: $STACK_NAME"
+        echo "  - EnvName: $ENV_NAME"
+        echo "  - ServiceName: $SERVICE_NAME"
+        echo "stack-exists=true" >> $GITHUB_OUTPUT
+        echo "stack-name=$STACK_NAME" >> $GITHUB_OUTPUT
+
+    - name: Delete CloudFormation Stack
+      if: steps.verify-stack.outputs.stack-exists == 'true'
+      shell: bash
+      run: |
+        STACK_NAME="${{ steps.verify-stack.outputs.stack-name }}"
+        echo "Deleting CloudFormation stack: $STACK_NAME"
+
+        aws cloudformation delete-stack \
+          --stack-name "$STACK_NAME" \
+          --region ${{ inputs.aws-region }}
+
+        echo "Waiting for stack deletion to complete..."
+        aws cloudformation wait stack-delete-complete \
+          --stack-name "$STACK_NAME" \
+          --region ${{ inputs.aws-region }}
+        echo "✅ Stack deleted successfully"
+
+    - name: Set Final Status
+      id: final-status
+      shell: bash
+      run: |
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "✅ PR #${{ inputs.pr-number }} cleanup completed successfully"
