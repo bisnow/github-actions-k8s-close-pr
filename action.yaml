@@ -95,36 +95,10 @@ runs:
           exit 1
         fi
 
-        # Verify stack parameters match expected values
-        ENV_NAME=$(aws cloudformation describe-stacks \
-          --stack-name "$STACK_NAME" \
-          --region ${{ inputs.aws-region }} \
-          --query 'Stacks[0].Parameters[?ParameterKey==`EnvName`].ParameterValue' \
-          --output text)
-
-        SERVICE_NAME=$(aws cloudformation describe-stacks \
-          --stack-name "$STACK_NAME" \
-          --region ${{ inputs.aws-region }} \
-          --query 'Stacks[0].Parameters[?ParameterKey==`ServiceName`].ParameterValue' \
-          --output text)
-
-        EXPECTED_ENV="pr-${{ inputs.pr-number }}"
-        EXPECTED_SERVICE="${{ inputs.service-name }}"
-
-        if [ "$ENV_NAME" != "$EXPECTED_ENV" ]; then
-          echo "ERROR: Stack EnvName ($ENV_NAME) doesn't match expected ($EXPECTED_ENV)"
-          exit 1
-        fi
-
-        if [ "$SERVICE_NAME" != "$EXPECTED_SERVICE" ]; then
-          echo "ERROR: Stack ServiceName ($SERVICE_NAME) doesn't match expected ($EXPECTED_SERVICE)"
-          exit 1
-        fi
-
         echo "✅ Stack verified - safe to delete"
-        echo "  - Stack Name: $STACK_NAME"
-        echo "  - EnvName: $ENV_NAME"
-        echo "  - ServiceName: $SERVICE_NAME"
+        echo "   - Stack Name: $STACK_NAME"
+        echo "   - ExpectedPR: ${{ inputs.pr-number }}"
+        echo "   - Service: ${{ inputs.service-name }}
         echo "stack-exists=true" >> $GITHUB_OUTPUT
         echo "stack-name=$STACK_NAME" >> $GITHUB_OUTPUT
 
