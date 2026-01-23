@@ -3,7 +3,7 @@ description: 'Safely cleanup Kubernetes PR stack resources, and CloudFormation s
 
 inputs:
   pr-number:
-    description: 'Pull request number'
+    description: 'Pull request number (numeric only, e.g., "123")'
     required: true
   app-name:
     description: 'Application name (used for resource queries to prevent namespace collisions)'
@@ -48,35 +48,83 @@ runs:
       run: |
         aws eks update-kubeconfig --region ${{ inputs.aws-region }} --name ${{ inputs.eks-cluster-name }}
 
+    - name: Validate PR Number Format
+      id: validate-pr
+      shell: bash
+      run: |
+        PR_INPUT="${{ inputs.pr-number }}"
+        echo "Validating PR number input: $PR_INPUT"
+
+        # Strip 'pr-' prefix if present
+        PR_NUM="${PR_INPUT#pr-}"
+
+        # Verify it's now just a number
+        if ! [[ "$PR_NUM" =~ ^[0-9]+$ ]]; then
+          echo "ERROR: pr-number must be a numeric value or 'pr-{number}'"
+          echo "ERROR: Received: $PR_INPUT"
+          echo "ERROR: Please provide just the PR number (e.g., '123' not 'pr-123')"
+          exit 1
+        fi
+
+        echo "Valid PR number: $PR_NUM"
+        echo "pr-number=$PR_NUM" >> $GITHUB_OUTPUT
+
     - name: Delete PR Stack Helm Release
       shell: bash
       run: |
-        echo "Deleting Helm release for PR #${{ inputs.pr-number }}..."
-        helm delete pr-${{ inputs.pr-number }} \
+        PR_NUM="${{ steps.validate-pr.outputs.pr-number }}"
+        echo "Deleting Helm release for PR #$PR_NUM..."
+        helm delete pr-$PR_NUM \
           --namespace ${{ inputs.namespace }} \
           --no-hooks || echo "Release may not exist or already deleted"
 
     - name: Verify Kubernetes Resources Cleaned Up
       shell: bash
       run: |
+        PR_NUM="${{ steps.validate-pr.outputs.pr-number }}"
         echo "Verifying all Kubernetes resources are deleted..."
+
+        # Wait up to 3 minutes for resources to be cleaned up
+        MAX_WAIT=180
+        WAIT_INTERVAL=10
+        ELAPSED=0
+
+        while [ $ELAPSED -lt $MAX_WAIT ]; do
+          PODS=$(kubectl get pod -n ${{ inputs.namespace }} \
+            -l pr-number=$PR_NUM,app=${{ inputs.app-name }} \
+            --no-headers 2>/dev/null | wc -l)
+
+          if [ "$PODS" -eq 0 ]; then
+            echo "All pods deleted successfully (after ${ELAPSED}s)"
+            exit 0
+          fi
+
+          echo "Waiting for $PODS pod(s) to terminate... (${ELAPSED}s/${MAX_WAIT}s)"
+          sleep $WAIT_INTERVAL
+          ELAPSED=$((ELAPSED + WAIT_INTERVAL))
+        done
+
+        # Timeout reached, pods still exist - FAIL
         PODS=$(kubectl get pod -n ${{ inputs.namespace }} \
-          -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} \
+          -l pr-number=$PR_NUM,app=${{ inputs.app-name }} \
           --no-headers 2>/dev/null | wc -l)
 
-        if [ "$PODS" -eq 0 ]; then
-          echo "✅ All pods deleted successfully"
-        else
-          echo "⚠️  Warning: $PODS pod(s) still exist"
-          kubectl get pod -n ${{ inputs.namespace }} \
-            -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }}
-        fi
+        echo "======KUBERNETES CLEANUP FAILED======"
+        echo "$PODS pod(s) still exist after ${MAX_WAIT}s timeout:"
+        echo ""
+        kubectl get pod -n ${{ inputs.namespace }} \
+          -l pr-number=$PR_NUM,app=${{ inputs.app-name }}
+        echo ""
+        echo "CloudFormation stack will NOT be deleted for safety."
+        echo "Please investigate and manually clean up resources."
+        exit 1
 
     - name: Verify CloudFormation Stack Before Deletion
       id: verify-stack
       shell: bash
       run: |
-        STACK_NAME="${{ inputs.cloudformation-stack-prefix }}${{ inputs.pr-number }}"
+        PR_NUM="${{ steps.validate-pr.outputs.pr-number }}"
+        STACK_NAME="${{ inputs.cloudformation-stack-prefix }}$PR_NUM"
         echo "Verifying CloudFormation stack: $STACK_NAME"
 
         # Check if stack exists
@@ -95,10 +143,10 @@ runs:
           exit 1
         fi
 
-        echo "✅ Stack verified - safe to delete"
+        echo "Stack verified - safe to delete"
         echo "   - Stack Name: $STACK_NAME"
-        echo "   - ExpectedPR: ${{ inputs.pr-number }}"
-        echo "   - Service: ${{ inputs.service-name }}
+        echo "   - ExpectedPR: $PR_NUM"
+        echo "   - Service: ${{ inputs.service-name }}"
         echo "stack-exists=true" >> $GITHUB_OUTPUT
         echo "stack-name=$STACK_NAME" >> $GITHUB_OUTPUT
 
@@ -113,26 +161,84 @@ runs:
           --stack-name "$STACK_NAME" \
           --region ${{ inputs.aws-region }}
 
-        echo "Waiting for stack deletion to complete..."
-        aws cloudformation wait stack-delete-complete \
-          --stack-name "$STACK_NAME" \
-          --region ${{ inputs.aws-region }}
-        echo "✅ Stack deleted successfully"
+        echo "Waiting for stack deletion to complete (timeout: 10 minutes)..."
 
-    - name: Set Final Status
+        # Wait with timeout (check every 30s for max 10 minutes)
+        MAX_ATTEMPTS=20
+        ATTEMPT=0
+
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ inputs.aws-region }} \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "DELETED")
+
+          if [ "$STACK_STATUS" == "DELETED" ]; then
+            echo "Stack deleted successfully"
+            break
+          elif [ "$STACK_STATUS" == "DELETE_FAILED" ]; then
+            echo "Stack deletion failed - will be verified in next step"
+            break
+          elif [ "$STACK_STATUS" == "DELETE_IN_PROGRESS" ]; then
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Stack deletion in progress... (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+            sleep 30
+          else
+            echo "Unexpected stack status: $STACK_STATUS"
+            break
+          fi
+        done
+
+        if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+          echo "Timeout waiting for stack deletion after 10 minutes"
+        fi
+
+    - name: Verify CloudFormation Stack Deleted
+      if: steps.verify-stack.outputs.stack-exists == 'true'
+      shell: bash
+      run: |
+        STACK_NAME="${{ steps.verify-stack.outputs.stack-name }}"
+        echo "Verifying CloudFormation stack is fully deleted: $STACK_NAME"
+
+        # Check if stack still exists
+        if aws cloudformation describe-stacks \
+          --stack-name "$STACK_NAME" \
+          --region ${{ inputs.aws-region }} &>/dev/null; then
+
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region ${{ inputs.aws-region }} \
+            --query 'Stacks[0].StackStatus' \
+            --output text)
+
+          echo "=====CLOUDFORMATION DELETION FAILED====="
+          echo "Stack still exists with status: $STACK_STATUS"
+          echo "Stack name: $STACK_NAME"
+          echo ""
+          echo "Please investigate and manually delete the stack."
+          exit 1
+        fi
+
+        echo "CloudFormation stack successfully deleted"
+
+    - name: Cleanup Complete
       id: final-status
       shell: bash
       run: |
+        PR_NUM="${{ steps.validate-pr.outputs.pr-number }}"
+        echo "PR #$PR_NUM CLEANUP COMPLETED"
+        echo "All resources successfully removed"
         echo "status=success" >> $GITHUB_OUTPUT
-        echo "✅ PR #${{ inputs.pr-number }} cleanup completed successfully"
 
     - name: Summary
       shell: bash
       run: |
-        echo "## 🧹 PR Environment Cleaned Up" >> $GITHUB_STEP_SUMMARY
+        PR_NUM="${{ steps.validate-pr.outputs.pr-number }}"
+        echo "## PR Environment Cleaned Up" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**Service:** \`${{ inputs.service-name }}\` (\`${{ inputs.app-name }}\`)" >> $GITHUB_STEP_SUMMARY
-        echo "**PR #${{ inputs.pr-number }}** resources have been deleted:" >> $GITHUB_STEP_SUMMARY
-        echo "- ✅ Helm release: \`pr-${{ inputs.pr-number }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- ✅ CloudFormation stack: \`${{ inputs.cloudformation-stack-prefix }}${{ inputs.pr-number }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- ✅ All Kubernetes resources removed" >> $GITHUB_STEP_SUMMARY
+        echo "**PR #$PR_NUM** resources have been deleted:" >> $GITHUB_STEP_SUMMARY
+        echo "- Helm release: \`pr-$PR_NUM\`" >> $GITHUB_STEP_SUMMARY
+        echo "- CloudFormation stack: \`${{ inputs.cloudformation-stack-prefix }}$PR_NUM\`" >> $GITHUB_STEP_SUMMARY
+        echo "- All Kubernetes resources removed" >> $GITHUB_STEP_SUMMARY
