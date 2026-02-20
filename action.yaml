@@ -98,7 +98,7 @@ runs:
         echo "✅ Stack verified - safe to delete"
         echo "   - Stack Name: $STACK_NAME"
         echo "   - ExpectedPR: ${{ inputs.pr-number }}"
-        echo "   - Service: ${{ inputs.service-name }}
+        echo "   - Service: ${{ inputs.service-name }}"
         echo "stack-exists=true" >> $GITHUB_OUTPUT
         echo "stack-name=$STACK_NAME" >> $GITHUB_OUTPUT
 
