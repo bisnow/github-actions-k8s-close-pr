@@ -49,12 +49,39 @@ runs:
         aws eks update-kubeconfig --region ${{ inputs.aws-region }} --name ${{ inputs.eks-cluster-name }}
 
     - name: Delete PR Stack Helm Release
+      id: delete-helm
       shell: bash
       run: |
-        echo "Deleting Helm release for PR #${{ inputs.pr-number }}..."
-        helm delete pr-${{ inputs.pr-number }} \
+        RELEASE_PREFIX="pr-${{ inputs.pr-number }}-"
+        MAX_APP_LEN=$((53 - ${#RELEASE_PREFIX}))
+        APP_NAME="${{ inputs.app-name }}"
+
+        if [ ${#APP_NAME} -gt $MAX_APP_LEN ]; then
+          APP_NAME="${APP_NAME:0:$MAX_APP_LEN}"
+          echo "Warning: app-name truncated to ${MAX_APP_LEN} chars to fit Helm 53-char release name limit: ${APP_NAME}"
+        fi
+
+        RELEASE_NAME="${RELEASE_PREFIX}${APP_NAME}"
+        echo "release-name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+        echo "Deleting Helm release ${RELEASE_NAME}..."
+
+        set +e
+        DELETE_OUTPUT=$(helm delete "${RELEASE_NAME}" \
           --namespace ${{ inputs.namespace }} \
-          --no-hooks || echo "Release may not exist or already deleted"
+          --no-hooks 2>&1)
+        DELETE_EXIT=$?
+        set -e
+
+        if [ $DELETE_EXIT -ne 0 ]; then
+          if echo "$DELETE_OUTPUT" | grep -q "release: not found"; then
+            echo "Release not found - already deleted or never deployed"
+          else
+            echo "ERROR: ${DELETE_OUTPUT}"
+            exit $DELETE_EXIT
+          fi
+        else
+          echo "$DELETE_OUTPUT"
+        fi
 
     - name: Verify Kubernetes Resources Cleaned Up
       shell: bash
@@ -65,7 +92,7 @@ runs:
           --no-headers 2>/dev/null | wc -l)
 
         if [ "$PODS" -eq 0 ]; then
-          echo "✅ All pods deleted successfully"
+          echo "All pods deleted successfully"
         else
           echo "⚠️  Warning: $PODS pod(s) still exist"
           kubectl get pod -n ${{ inputs.namespace }} \
@@ -95,7 +122,7 @@ runs:
           exit 1
         fi
 
-        echo "✅ Stack verified - safe to delete"
+        echo "Stack verified - safe to delete"
         echo "   - Stack Name: $STACK_NAME"
         echo "   - ExpectedPR: ${{ inputs.pr-number }}"
         echo "   - Service: ${{ inputs.service-name }}"
@@ -117,22 +144,22 @@ runs:
         aws cloudformation wait stack-delete-complete \
           --stack-name "$STACK_NAME" \
           --region ${{ inputs.aws-region }}
-        echo "✅ Stack deleted successfully"
+        echo "Stack deleted successfully"
 
     - name: Set Final Status
       id: final-status
       shell: bash
       run: |
         echo "status=success" >> $GITHUB_OUTPUT
-        echo "✅ PR #${{ inputs.pr-number }} cleanup completed successfully"
+        echo "PR #${{ inputs.pr-number }} cleanup completed successfully"
 
     - name: Summary
       shell: bash
       run: |
-        echo "## 🧹 PR Environment Cleaned Up" >> $GITHUB_STEP_SUMMARY
+        echo "## PR Environment Cleaned Up" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**Service:** \`${{ inputs.service-name }}\` (\`${{ inputs.app-name }}\`)" >> $GITHUB_STEP_SUMMARY
         echo "**PR #${{ inputs.pr-number }}** resources have been deleted:" >> $GITHUB_STEP_SUMMARY
-        echo "- ✅ Helm release: \`pr-${{ inputs.pr-number }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- ✅ CloudFormation stack: \`${{ inputs.cloudformation-stack-prefix }}${{ inputs.pr-number }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- ✅ All Kubernetes resources removed" >> $GITHUB_STEP_SUMMARY
+        echo "- Helm release: \`${{ steps.delete-helm.outputs.release-name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- CloudFormation stack: \`${{ inputs.cloudformation-stack-prefix }}${{ inputs.pr-number }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- All Kubernetes resources removed" >> $GITHUB_STEP_SUMMARY
