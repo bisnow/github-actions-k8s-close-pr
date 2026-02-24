@@ -52,8 +52,8 @@ runs:
       id: delete-helm
       shell: bash
       run: |
-        RELEASE_PREFIX="pr-${{ inputs.pr-number }}-"
-        MAX_APP_LEN=$((53 - ${#RELEASE_PREFIX}))
+        RELEASE_SUFFIX="-pr-${{ inputs.pr-number }}"
+        MAX_APP_LEN=$((53 - ${#RELEASE_SUFFIX}))
         APP_NAME="${{ inputs.app-name }}"
 
         if [ ${#APP_NAME} -gt $MAX_APP_LEN ]; then
@@ -61,7 +61,7 @@ runs:
           echo "Warning: app-name truncated to ${MAX_APP_LEN} chars to fit Helm 53-char release name limit: ${APP_NAME}"
         fi
 
-        RELEASE_NAME="${RELEASE_PREFIX}${APP_NAME}"
+        RELEASE_NAME="${APP_NAME}${RELEASE_SUFFIX}"
         echo "release-name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
         echo "Deleting Helm release ${RELEASE_NAME}..."
 
