@@ -67,8 +67,7 @@ runs:
 
         set +e
         DELETE_OUTPUT=$(helm delete "${RELEASE_NAME}" \
-          --namespace ${{ inputs.namespace }} \
-          --no-hooks 2>&1)
+          --namespace ${{ inputs.namespace }} 2>&1)
         DELETE_EXIT=$?
         set -e
 
