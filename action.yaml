@@ -3,8 +3,13 @@ description: 'Safely cleanup Kubernetes PR stack resources, and CloudFormation s
 
 inputs:
   pr-number:
-    description: 'Pull request number'
-    required: true
+    description: 'Pull request number. Used for the summary and, unless stack-id is set, as the stack identity. Omit for a PR-independent dev stack (pass stack-id instead).'
+    required: false
+    default: ''
+  stack-id:
+    description: 'Stable stack identity used to reconstruct the release name (<app>-pr-<stack-id>), pr-number label, and CloudFormation stack name. A PR number ("123") or a dev-stack slug ("dev-authfix"). Defaults to pr-number.'
+    required: false
+    default: ''
   app-name:
     description: 'Application name (used for resource queries to prevent namespace collisions)'
     required: true
@@ -48,11 +53,36 @@ runs:
       run: |
         aws eks update-kubeconfig --region ${{ inputs.aws-region }} --name ${{ inputs.eks-cluster-name }}
 
+    - name: Resolve stack identity
+      shell: bash
+      env:
+        STACK_ID_INPUT: ${{ inputs.stack-id }}
+        PR_NUMBER_INPUT: ${{ inputs.pr-number }}
+      run: |
+        set -euo pipefail
+        # Identity used to reconstruct the release/label/CF-stack names. Defaults
+        # to the PR number so existing callers are unchanged; dev stacks pass a
+        # non-PR slug via stack-id.
+        STACK_ID="${STACK_ID_INPUT:-}"
+        if [ -z "${STACK_ID}" ]; then
+          STACK_ID="${PR_NUMBER_INPUT:-}"
+        fi
+        if [ -z "${STACK_ID}" ]; then
+          echo "ERROR: one of stack-id or pr-number must be provided."
+          exit 1
+        fi
+        if ! printf '%s' "${STACK_ID}" | grep -qE '^([0-9]+|dev-[a-z0-9][a-z0-9-]*)$'; then
+          echo "ERROR: stack identity '${STACK_ID}' must be a PR number or a dev-<slug>."
+          exit 1
+        fi
+        echo "STACK_ID=${STACK_ID}" >> "$GITHUB_ENV"
+        echo "Resolved stack identity: ${STACK_ID}"
+
     - name: Delete PR Stack Helm Release
       id: delete-helm
       shell: bash
       run: |
-        RELEASE_SUFFIX="-pr-${{ inputs.pr-number }}"
+        RELEASE_SUFFIX="-pr-${STACK_ID}"
         MAX_APP_LEN=$((53 - ${#RELEASE_SUFFIX}))
         APP_NAME="${{ inputs.app-name }}"
 
@@ -87,7 +117,7 @@ runs:
       run: |
         echo "Verifying all Kubernetes resources are deleted..."
         PODS=$(kubectl get pod -n ${{ inputs.namespace }} \
-          -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }} \
+          -l pr-number=${STACK_ID},app=${{ inputs.app-name }} \
           --no-headers 2>/dev/null | wc -l)
 
         if [ "$PODS" -eq 0 ]; then
@@ -95,14 +125,14 @@ runs:
         else
           echo "⚠️  Warning: $PODS pod(s) still exist"
           kubectl get pod -n ${{ inputs.namespace }} \
-            -l pr-number=${{ inputs.pr-number }},app=${{ inputs.app-name }}
+            -l pr-number=${STACK_ID},app=${{ inputs.app-name }}
         fi
 
     - name: Verify CloudFormation Stack Before Deletion
       id: verify-stack
       shell: bash
       run: |
-        STACK_NAME="${{ inputs.cloudformation-stack-prefix }}${{ inputs.pr-number }}"
+        STACK_NAME="${{ inputs.cloudformation-stack-prefix }}${STACK_ID}"
         echo "Verifying CloudFormation stack: $STACK_NAME"
 
         # Check if stack exists
@@ -114,16 +144,16 @@ runs:
           exit 0
         fi
 
-        # Verify stack name matches PR pattern (prefix + digits)
-        if [[ ! "$STACK_NAME" =~ ^${{ inputs.cloudformation-stack-prefix }}[0-9]+$ ]]; then
-          echo "ERROR: Stack name doesn't match expected PR pattern: $STACK_NAME"
-          echo "ERROR: Expected pattern: ${{ inputs.cloudformation-stack-prefix }}[0-9]+"
+        # Verify stack name matches a PR (prefix + digits) or dev (prefix + dev-<slug>) pattern
+        if [[ ! "$STACK_NAME" =~ ^${{ inputs.cloudformation-stack-prefix }}([0-9]+|dev-[a-z0-9][a-z0-9-]*)$ ]]; then
+          echo "ERROR: Stack name doesn't match expected PR/dev pattern: $STACK_NAME"
+          echo "ERROR: Expected pattern: ${{ inputs.cloudformation-stack-prefix }}([0-9]+|dev-<slug>)"
           exit 1
         fi
 
         echo "Stack verified - safe to delete"
         echo "   - Stack Name: $STACK_NAME"
-        echo "   - ExpectedPR: ${{ inputs.pr-number }}"
+        echo "   - Identity: ${STACK_ID}"
         echo "   - Service: ${{ inputs.service-name }}"
         echo "stack-exists=true" >> $GITHUB_OUTPUT
         echo "stack-name=$STACK_NAME" >> $GITHUB_OUTPUT
@@ -150,7 +180,7 @@ runs:
       shell: bash
       run: |
         echo "status=success" >> $GITHUB_OUTPUT
-        echo "PR #${{ inputs.pr-number }} cleanup completed successfully"
+        echo "Stack ${STACK_ID} cleanup completed successfully"
 
     - name: Summary
       shell: bash
@@ -158,7 +188,7 @@ runs:
         echo "## PR Environment Cleaned Up" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**Service:** \`${{ inputs.service-name }}\` (\`${{ inputs.app-name }}\`)" >> $GITHUB_STEP_SUMMARY
-        echo "**PR #${{ inputs.pr-number }}** resources have been deleted:" >> $GITHUB_STEP_SUMMARY
+        echo "**Stack \`${STACK_ID}\`** resources have been deleted:" >> $GITHUB_STEP_SUMMARY
         echo "- Helm release: \`${{ steps.delete-helm.outputs.release-name }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- CloudFormation stack: \`${{ inputs.cloudformation-stack-prefix }}${{ inputs.pr-number }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- CloudFormation stack: \`${{ inputs.cloudformation-stack-prefix }}${STACK_ID}\`" >> $GITHUB_STEP_SUMMARY
         echo "- All Kubernetes resources removed" >> $GITHUB_STEP_SUMMARY
