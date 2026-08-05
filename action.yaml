@@ -34,6 +34,10 @@ inputs:
     description: 'EKS cluster name for kubectl configuration'
     required: false
     default: 'bisnow-non-prod-eks'
+  force:
+    description: 'Force-delete a stuck/orphaned stack. When "true", after the normal helm delete the action also discovers the ACTUAL release name from the workload labels (app + pr-number) and deletes it, plus any lingering labeled resources — clearing a stack that was deployed under a release name this action cannot reconstruct (the draft/rename orphan). Off by default; the normal path is unchanged.'
+    required: false
+    default: 'false'
 
 outputs:
   cleanup-status:
@@ -101,31 +105,99 @@ runs:
         DELETE_EXIT=$?
         set -e
 
+        # release-missing records that helm had nothing to delete under the
+        # expected name. On its own that's the idempotent case (already torn
+        # down). But paired with live pods it means the running stack was
+        # deployed under a DIFFERENT release name than we reconstructed — a
+        # silent no-op that used to report success. The verify step below cross-
+        # checks the two and fails loudly on that mismatch.
         if [ $DELETE_EXIT -ne 0 ]; then
           if echo "$DELETE_OUTPUT" | grep -q "release: not found"; then
             echo "Release not found - already deleted or never deployed"
+            echo "release-missing=true" >> $GITHUB_OUTPUT
           else
             echo "ERROR: ${DELETE_OUTPUT}"
             exit $DELETE_EXIT
           fi
         else
           echo "$DELETE_OUTPUT"
+          echo "release-missing=false" >> $GITHUB_OUTPUT
         fi
+
+    - name: Force-delete lingering release and resources
+      if: inputs.force == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        NS="${{ inputs.namespace }}"
+        APP="${{ inputs.app-name }}"
+        SELECTOR="pr-number=${STACK_ID},app=${APP}"
+        echo "Force mode: discovering the ACTUAL release behind ${SELECTOR} in ${NS}..."
+
+        # The helm-chart-pr-stack chart names the workload after the release, so
+        # the Deployment/StatefulSet name IS the real release name — even when it
+        # differs from the reconstructed <app>-pr-<id> (the draft/rename orphan
+        # the normal delete can't reach). Resolve it from the workload labels.
+        RELEASES=$(kubectl get deploy,statefulset -n "$NS" -l "$SELECTOR" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | sort -u | grep -v '^$' || true)
+
+        if [ -n "$RELEASES" ]; then
+          while IFS= read -r rel; do
+            echo "Force-deleting helm release ${rel}..."
+            helm delete "$rel" --namespace "$NS" 2>&1 || echo "  (helm delete ${rel} returned non-zero — continuing)"
+          done <<< "$RELEASES"
+        else
+          echo "No workload found for ${SELECTOR} — nothing to resolve via helm."
+        fi
+
+        # Backstop: delete any resources still carrying the stack's labels, so a
+        # release whose helm metadata is already gone (but whose objects linger)
+        # is also cleared. Scoped tightly by app + pr-number, so it can only touch
+        # this stack's objects.
+        echo "Sweeping any labeled leftovers for ${SELECTOR}..."
+        kubectl delete deploy,statefulset,replicaset,pod,svc,ingress,secret,configmap,pvc,job \
+          -n "$NS" -l "$SELECTOR" --ignore-not-found --wait=false 2>&1 || true
 
     - name: Verify Kubernetes Resources Cleaned Up
       shell: bash
+      env:
+        RELEASE_MISSING: ${{ steps.delete-helm.outputs.release-missing }}
+        RELEASE_NAME: ${{ steps.delete-helm.outputs.release-name }}
       run: |
-        echo "Verifying all Kubernetes resources are deleted..."
-        PODS=$(kubectl get pod -n ${{ inputs.namespace }} \
-          -l pr-number=${STACK_ID},app=${{ inputs.app-name }} \
-          --no-headers 2>/dev/null | wc -l)
+        set -euo pipefail
+        NS="${{ inputs.namespace }}"
+        SELECTOR="pr-number=${STACK_ID},app=${{ inputs.app-name }}"
 
-        if [ "$PODS" -eq 0 ]; then
-          echo "All pods deleted successfully"
-        else
-          echo "⚠️  Warning: $PODS pod(s) still exist"
-          kubectl get pod -n ${{ inputs.namespace }} \
-            -l pr-number=${STACK_ID},app=${{ inputs.app-name }}
+        # helm delete returns immediately; the workload terminates asynchronously.
+        # Poll until the app's pods are gone, then assert. A green run must MEAN
+        # the stack is gone — the old warn-only check let a failed/no-op teardown
+        # report success, which is how draft/renamed stacks became invisible
+        # orphans the dashboard couldn't clear.
+        echo "Verifying pods for ${SELECTOR} in ${NS} are gone..."
+        PODS=0
+        for attempt in $(seq 1 18); do   # ~3 min (18 × 10s)
+          PODS=$(kubectl get pod -n "$NS" -l "$SELECTOR" --no-headers 2>/dev/null | grep -c . || true)
+          if [ "$PODS" -eq 0 ]; then
+            echo "All pods deleted successfully"
+            break
+          fi
+          echo "  ${PODS} pod(s) still terminating (attempt ${attempt}/18)..."
+          sleep 10
+        done
+
+        if [ "$PODS" -ne 0 ]; then
+          echo "::error::Teardown incomplete — ${PODS} pod(s) for ${SELECTOR} still running after helm delete."
+          kubectl get pod -n "$NS" -l "$SELECTOR" || true
+          if [ "${RELEASE_MISSING:-}" = "true" ]; then
+            # helm found nothing under RELEASE_NAME, yet the workload is live: the
+            # running stack was deployed under a different release name than we
+            # reconstructed (the classic draft/rename orphan). Deleting by the
+            # expected name can never clear it — a human/force-delete must.
+            echo "::error::helm reported '${RELEASE_NAME}' not found, but its pods are live — the stack was deployed under a DIFFERENT release name. Reconstructed identity does not match the live release; force-delete required."
+            echo "Live helm releases in ${NS} matching this app:"
+            helm list -n "$NS" --all --filter "^${{ inputs.app-name }}-pr-" 2>/dev/null || true
+          fi
+          exit 1
         fi
 
     - name: Verify CloudFormation Stack Before Deletion

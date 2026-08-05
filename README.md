@@ -67,7 +67,12 @@ jobs:
 1. Assumes AWS role for the specified account
 2. Configures kubectl for the EKS cluster
 3. Deletes the Helm release `pr-{number}` from the namespace
-4. Verifies all Kubernetes pods are removed
+4. Verifies all Kubernetes pods are removed — **polls up to ~3 min and fails the
+   run if any remain**, so a green run means the stack is actually gone. If helm
+   reported the release "not found" but its pods are still live (the stack was
+   deployed under a different release name — e.g. a draft/renamed orphan), the
+   run fails with an explicit force-delete-required error instead of silently
+   reporting success.
 5. Verifies the CloudFormation stack matches the PR (checks stack name pattern and parameters)
 6. Deletes the CloudFormation stack and waits for completion
 
