@@ -7,7 +7,7 @@ inputs:
     required: false
     default: ''
   stack-id:
-    description: 'Stable stack identity used to reconstruct the release name (<app>-pr-<stack-id>), pr-number label, and CloudFormation stack name. A PR number ("123") or a dev-stack slug ("dev-authfix"). Defaults to pr-number.'
+    description: 'Stable stack identity used to reconstruct the release name (<app>-pr-<stack-id>), pr-number label, and CloudFormation stack name. A PR number ("123"), a dev-stack slug ("dev-authfix"), or a sandbox-stack slug ("sbx-search"). Defaults to pr-number.'
     required: false
     default: ''
   app-name:
@@ -75,8 +75,8 @@ runs:
           echo "ERROR: one of stack-id or pr-number must be provided."
           exit 1
         fi
-        if ! printf '%s' "${STACK_ID}" | grep -qE '^([0-9]+|dev-[a-z0-9][a-z0-9-]*)$'; then
-          echo "ERROR: stack identity '${STACK_ID}' must be a PR number or a dev-<slug>."
+        if ! printf '%s' "${STACK_ID}" | grep -qE '^([0-9]+|(dev|sbx)-[a-z0-9][a-z0-9-]*)$'; then
+          echo "ERROR: stack identity '${STACK_ID}' must be a PR number, a dev-<slug>, or an sbx-<slug>."
           exit 1
         fi
         echo "STACK_ID=${STACK_ID}" >> "$GITHUB_ENV"
@@ -216,10 +216,11 @@ runs:
           exit 0
         fi
 
-        # Verify stack name matches a PR (prefix + digits) or dev (prefix + dev-<slug>) pattern
-        if [[ ! "$STACK_NAME" =~ ^${{ inputs.cloudformation-stack-prefix }}([0-9]+|dev-[a-z0-9][a-z0-9-]*)$ ]]; then
-          echo "ERROR: Stack name doesn't match expected PR/dev pattern: $STACK_NAME"
-          echo "ERROR: Expected pattern: ${{ inputs.cloudformation-stack-prefix }}([0-9]+|dev-<slug>)"
+        # Verify stack name matches a PR (prefix + digits), dev (prefix + dev-<slug>)
+        # or sandbox (prefix + sbx-<slug>) pattern
+        if [[ ! "$STACK_NAME" =~ ^${{ inputs.cloudformation-stack-prefix }}([0-9]+|(dev|sbx)-[a-z0-9][a-z0-9-]*)$ ]]; then
+          echo "ERROR: Stack name doesn't match expected PR/dev/sandbox pattern: $STACK_NAME"
+          echo "ERROR: Expected pattern: ${{ inputs.cloudformation-stack-prefix }}([0-9]+|(dev|sbx)-<slug>)"
           exit 1
         fi
 
