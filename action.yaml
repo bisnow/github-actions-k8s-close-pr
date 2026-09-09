@@ -75,7 +75,11 @@ runs:
           echo "ERROR: one of stack-id or pr-number must be provided."
           exit 1
         fi
-        if ! printf '%s' "${STACK_ID}" | grep -qE '^([0-9]+|(dev|sbx)-[a-z0-9][a-z0-9-]*)$'; then
+        # [[ ]] not grep: grep anchors match per LINE, so a value like
+        # $'123\nEVIL=1' passes (its first line matches) and the $GITHUB_ENV write
+        # below then injects an arbitrary variable into every later step — which
+        # run aws/kubectl/helm under an assumed role. [[ ]] anchors the whole string.
+        if ! [[ "${STACK_ID}" =~ ^([0-9]+|(dev|sbx)-[a-z0-9][a-z0-9-]*)$ ]]; then
           echo "ERROR: stack identity '${STACK_ID}' must be a PR number, a dev-<slug>, or an sbx-<slug>."
           exit 1
         fi
@@ -115,6 +119,32 @@ runs:
           if echo "$DELETE_OUTPUT" | grep -q "release: not found"; then
             echo "Release not found - already deleted or never deployed"
             echo "release-missing=true" >> $GITHUB_OUTPUT
+          elif echo "$DELETE_OUTPUT" | grep -qiE 'exceeded quota|forbidden: failed quota'; then
+            # The chart's pre-delete hooks (cloudbeaver disconnect, overrides-cleanup)
+            # declare no resources. In a namespace whose ResourceQuota is exhausted,
+            # quota admission rejects those hook pods, so the hook never completes and
+            # the delete times out — leaving the stack undeletable and its quota still
+            # held. That deadlocks: you cannot free the quota without a teardown, and
+            # you cannot tear down without the quota. Retry without hooks to break it.
+            # Deliberately narrow: quota rejection only. A hook that fails or times
+            # out for any OTHER reason is a real signal, and retrying without hooks
+            # would bury it while skipping cleanup that should have run.
+            echo "Delete failed on a quota rejection; retrying with --no-hooks."
+            echo "  original error: ${DELETE_OUTPUT}"
+            set +e
+            RETRY_OUTPUT=$(helm delete "${RELEASE_NAME}" \
+              --namespace ${{ inputs.namespace }} --no-hooks 2>&1)
+            RETRY_EXIT=$?
+            set -e
+            if [ $RETRY_EXIT -ne 0 ]; then
+              echo "ERROR: --no-hooks retry also failed: ${RETRY_OUTPUT}"
+              exit $RETRY_EXIT
+            fi
+            echo "$RETRY_OUTPUT"
+            echo "WARNING: hooks were skipped. The CloudBeaver connection entry and the"
+            echo "         <release>-overrides Secret may survive; the verify step below"
+            echo "         still checks that the workloads themselves are gone."
+            echo "release-missing=false" >> $GITHUB_OUTPUT
           else
             echo "ERROR: ${DELETE_OUTPUT}"
             exit $DELETE_EXIT
