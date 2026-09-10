@@ -188,6 +188,24 @@ runs:
         kubectl delete deploy,statefulset,replicaset,pod,svc,ingress,secret,configmap,pvc,job \
           -n "$NS" -l "$SELECTOR" --ignore-not-found --wait=false 2>&1 || true
 
+        # The pgClone database objects carry a DIFFERENT label schema than the app:
+        # app=pr-stack-db, pr=<stack-id>, service=<app-name> (see helm-chart-pr-stack
+        # templates/pg-clone-{pvc,service,statefulset}.yaml). The sweep above matches
+        # none of them, so when a release's helm metadata is already gone -- exactly
+        # the orphan case force mode exists for -- the clone PVC survives. Its storage
+        # class is Delete reclaim, so a surviving PVC means a surviving FSx clone, and
+        # FSx refuses to delete the golden snapshot while any clone of it exists. One
+        # forced teardown then blocks golden-snapshot rotation indefinitely.
+        #
+        # service=<app-name> is REQUIRED, not decoration: stack ids are unique per app,
+        # not per namespace. hello-k8s-pr-sbx-probe and biscred-pr-sbx-probe coexisted
+        # in sandbox-stacks, both labelled pr=sbx-probe, so sweeping on pr+app alone
+        # would delete the other application's database.
+        DB_SELECTOR="pr=${STACK_ID},app=pr-stack-db,service=${APP}"
+        echo "Sweeping pgClone database leftovers for ${DB_SELECTOR}..."
+        kubectl delete statefulset,pod,svc,pvc \
+          -n "$NS" -l "$DB_SELECTOR" --ignore-not-found --wait=false 2>&1 || true
+
     - name: Verify Kubernetes Resources Cleaned Up
       shell: bash
       env:
@@ -197,6 +215,10 @@ runs:
         set -euo pipefail
         NS="${{ inputs.namespace }}"
         SELECTOR="pr-number=${STACK_ID},app=${{ inputs.app-name }}"
+        # pgClone DB objects use their own label schema; without this a surviving
+        # database pod (and its FSx clone) is invisible to the check below and the
+        # teardown reports success while the clone still exists.
+        DB_SELECTOR="pr=${STACK_ID},app=pr-stack-db,service=${{ inputs.app-name }}"
 
         # helm delete returns immediately; the workload terminates asynchronously.
         # Poll until the app's pods are gone, then assert. A green run must MEAN
@@ -206,7 +228,9 @@ runs:
         echo "Verifying pods for ${SELECTOR} in ${NS} are gone..."
         PODS=0
         for attempt in $(seq 1 18); do   # ~3 min (18 × 10s)
-          PODS=$(kubectl get pod -n "$NS" -l "$SELECTOR" --no-headers 2>/dev/null | grep -c . || true)
+          APP_PODS=$(kubectl get pod -n "$NS" -l "$SELECTOR" --no-headers 2>/dev/null | grep -c . || true)
+          DB_PODS=$(kubectl get pod -n "$NS" -l "$DB_SELECTOR" --no-headers 2>/dev/null | grep -c . || true)
+          PODS=$(( APP_PODS + DB_PODS ))
           if [ "$PODS" -eq 0 ]; then
             echo "All pods deleted successfully"
             break
@@ -218,6 +242,7 @@ runs:
         if [ "$PODS" -ne 0 ]; then
           echo "::error::Teardown incomplete — ${PODS} pod(s) for ${SELECTOR} still running after helm delete."
           kubectl get pod -n "$NS" -l "$SELECTOR" || true
+          kubectl get pod,pvc -n "$NS" -l "$DB_SELECTOR" || true
           if [ "${RELEASE_MISSING:-}" = "true" ]; then
             # helm found nothing under RELEASE_NAME, yet the workload is live: the
             # running stack was deployed under a different release name than we
