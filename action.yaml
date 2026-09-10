@@ -225,11 +225,40 @@ runs:
         # the stack is gone — the old warn-only check let a failed/no-op teardown
         # report success, which is how draft/renamed stacks became invisible
         # orphans the dashboard couldn't clear.
-        echo "Verifying pods for ${SELECTOR} in ${NS} are gone..."
+        # Count via a helper that FAILS on a kubectl error instead of reading it as
+        # zero. `kubectl ... 2>/dev/null | grep -c .` cannot tell "nothing is left"
+        # from "RBAC denied", "namespace typo" or "API timeout" -- all three print
+        # nothing to stdout and yield 0. Silent success is the exact failure class
+        # this verify step exists to prevent, so it must not be reachable from here.
+        # A nonexistent namespace is the one error class the helper below cannot see:
+        # `kubectl get -n missing-ns` exits 0 with an empty list, which would read as
+        # "everything is cleaned up". Check the namespace exists once, up front.
+        if ! kubectl get namespace "$NS" >/dev/null 2>&1; then
+          echo "::error::Cannot verify teardown — namespace '${NS}' does not exist or is unreadable."
+          exit 1
+        fi
+
+        ERRFILE="$(mktemp)"
+        COUNT=0
+        count_objects() {   # $1 = kind, $2 = selector -> sets COUNT
+          local out rc
+          set +e
+          out="$(kubectl get "$1" -n "$NS" -l "$2" -o name 2>"$ERRFILE")"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Cannot verify teardown — 'kubectl get $1 -l $2' failed in ${NS}:"
+            cat "$ERRFILE" >&2
+            exit 1
+          fi
+          COUNT="$(printf '%s' "$out" | grep -c . || true)"
+        }
+
+        echo "Verifying pods for ${SELECTOR} and ${DB_SELECTOR} in ${NS} are gone..."
         PODS=0
         for attempt in $(seq 1 18); do   # ~3 min (18 × 10s)
-          APP_PODS=$(kubectl get pod -n "$NS" -l "$SELECTOR" --no-headers 2>/dev/null | grep -c . || true)
-          DB_PODS=$(kubectl get pod -n "$NS" -l "$DB_SELECTOR" --no-headers 2>/dev/null | grep -c . || true)
+          count_objects pod "$SELECTOR";    APP_PODS="$COUNT"
+          count_objects pod "$DB_SELECTOR"; DB_PODS="$COUNT"
           PODS=$(( APP_PODS + DB_PODS ))
           if [ "$PODS" -eq 0 ]; then
             echo "All pods deleted successfully"
@@ -252,6 +281,32 @@ runs:
             echo "Live helm releases in ${NS} matching this app:"
             helm list -n "$NS" --all --filter "^${{ inputs.app-name }}-pr-" 2>/dev/null || true
           fi
+          exit 1
+        fi
+
+        # Pods gone is not the same as the volume gone, and the volume is the thing
+        # that matters: the pgClone PVC's storage class is Delete reclaim, and FSx
+        # refuses to delete the golden snapshot while any clone of it survives. The
+        # pod merely DELAYS the PVC (pvc-protection finalizer); it does not hold the
+        # FSx volume. So assert the claim itself is gone.
+        #
+        # This checks the PVC, not the PV: the CI deploy identity is namespace-scoped
+        # and `kubectl auth can-i list persistentvolumes` is NO for it, so a PV-level
+        # assertion would fail or, worse, fail open. A surviving PV whose claim is
+        # already deleted is therefore still invisible here -- see the FSx reconcile
+        # note in the PR.
+        echo "Verifying database volumes for ${DB_SELECTOR} in ${NS} are released..."
+        DB_PVCS=0
+        for attempt in $(seq 1 6); do   # ~1 min (6 × 10s); release trails the pod by seconds
+          count_objects pvc "$DB_SELECTOR"; DB_PVCS="$COUNT"
+          [ "$DB_PVCS" -eq 0 ] && break
+          echo "  ${DB_PVCS} database PVC(s) still present (attempt ${attempt}/6)..."
+          sleep 10
+        done
+
+        if [ "$DB_PVCS" -ne 0 ]; then
+          echo "::error::Teardown incomplete — ${DB_PVCS} database PVC(s) for ${DB_SELECTOR} survive in ${NS}. Their storage class is Delete reclaim, so the FSx clone is still allocated and the golden snapshot cannot be rotated until it is gone."
+          kubectl get pvc -n "$NS" -l "$DB_SELECTOR" || true
           exit 1
         fi
 
