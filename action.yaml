@@ -198,9 +198,9 @@ runs:
         # forced teardown then blocks golden-snapshot rotation indefinitely.
         #
         # service=<app-name> is REQUIRED, not decoration: stack ids are unique per app,
-        # not per namespace. hello-k8s-pr-sbx-probe and biscred-pr-sbx-probe coexisted
-        # in sandbox-stacks, both labelled pr=sbx-probe, so sweeping on pr+app alone
-        # would delete the other application's database.
+        # not per namespace. biscred and biscred-postgres both deploy into
+        # biscred-pr-stacks and can each hold DB objects labelled pr=80, so sweeping on
+        # pr + app=pr-stack-db alone would delete the other application's database.
         DB_SELECTOR="pr=${STACK_ID},app=pr-stack-db,service=${APP}"
         echo "Sweeping pgClone database leftovers for ${DB_SELECTOR}..."
         kubectl delete statefulset,pod,svc,pvc \
