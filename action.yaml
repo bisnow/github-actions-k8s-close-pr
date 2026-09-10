@@ -240,7 +240,7 @@ runs:
         done
 
         if [ "$PODS" -ne 0 ]; then
-          echo "::error::Teardown incomplete — ${PODS} pod(s) for ${SELECTOR} still running after helm delete."
+          echo "::error::Teardown incomplete — ${APP_PODS} app pod(s) for ${SELECTOR} and ${DB_PODS} database pod(s) for ${DB_SELECTOR} still running after helm delete."
           kubectl get pod -n "$NS" -l "$SELECTOR" || true
           kubectl get pod,pvc -n "$NS" -l "$DB_SELECTOR" || true
           if [ "${RELEASE_MISSING:-}" = "true" ]; then
