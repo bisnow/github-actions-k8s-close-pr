@@ -240,14 +240,28 @@ runs:
 
         ERRFILE="$(mktemp)"
         COUNT=0
+        # Retry before giving up. Failing closed is the point of this step, but a
+        # teardown makes up to 48 of these calls, and an etcd blip or a throttled
+        # API server is not evidence that a stack survived -- without a retry every
+        # transient error turns a good teardown red, which erodes the same green
+        # signal this step exists to make trustworthy. Three attempts, ~6s total:
+        # long enough to ride out a blip, short enough that a real outage still
+        # fails the run promptly.
         count_objects() {   # $1 = kind, $2 = selector -> sets COUNT
-          local out rc
-          set +e
-          out="$(kubectl get "$1" -n "$NS" -l "$2" -o name 2>"$ERRFILE")"
-          rc=$?
-          set -e
+          local out rc attempt
+          for attempt in 1 2 3; do
+            set +e
+            out="$(kubectl get "$1" -n "$NS" -l "$2" -o name 2>"$ERRFILE")"
+            rc=$?
+            set -e
+            [ "$rc" -eq 0 ] && break
+            if [ "$attempt" -lt 3 ]; then
+              echo "  'kubectl get $1 -l $2' failed (attempt ${attempt}/3), retrying..."
+              sleep 3
+            fi
+          done
           if [ "$rc" -ne 0 ]; then
-            echo "::error::Cannot verify teardown — 'kubectl get $1 -l $2' failed in ${NS}:"
+            echo "::error::Cannot verify teardown — 'kubectl get $1 -l $2' failed in ${NS} after 3 attempts:"
             cat "$ERRFILE" >&2
             exit 1
           fi
@@ -290,11 +304,14 @@ runs:
         # pod merely DELAYS the PVC (pvc-protection finalizer); it does not hold the
         # FSx volume. So assert the claim itself is gone.
         #
-        # This checks the PVC, not the PV: the CI deploy identity is namespace-scoped
-        # and `kubectl auth can-i list persistentvolumes` is NO for it, so a PV-level
-        # assertion would fail or, worse, fail open. A surviving PV whose claim is
-        # already deleted is therefore still invisible here -- see the FSx reconcile
-        # note in the PR.
+        # This checks the PVC, not the PV: `kubectl auth can-i list persistentvolumes`
+        # is NO for the CI identity (verified against the live cluster), so a PV-level
+        # assertion would fail or, worse, fail open. Note the identity is NOT purely
+        # namespace-scoped -- the flux-managers group also holds a cluster-wide
+        # ClusterRole granting namespaces:[get,list], which is what makes the
+        # `kubectl get namespace` guard above work. PVs simply are not in either
+        # grant. A surviving PV whose claim is already deleted is therefore still
+        # invisible here -- see the FSx reconcile note in the PR.
         echo "Verifying database volumes for ${DB_SELECTOR} in ${NS} are released..."
         DB_PVCS=0
         for attempt in $(seq 1 6); do   # ~1 min (6 × 10s); release trails the pod by seconds
